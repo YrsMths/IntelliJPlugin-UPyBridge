@@ -14,7 +14,12 @@ def pytype_to_uetype(annotation):
         return "const FString&"
     if isinstance(annotation, ast.Name):
         t = annotation.id
-        return {"str": "const FString&","int":"int32","float":"float","bool":"bool"}.get(t,"FString")
+        return {
+            "str": "const FString&",
+            "int": "int32",
+            "float": "float",
+            "bool": "bool"
+        }.get(t, "FString")
     return "const FString&"
 
 def is_ufunction_override(decorator):
@@ -34,6 +39,15 @@ def is_staticmethod(decorator):
         return True
     return False
 
+def has_unreal_uclass(decorator_list):
+    for d in decorator_list:
+        if isinstance(d, ast.Call):
+            func = d.func
+            if isinstance(func, ast.Attribute) and func.attr == 'uclass':
+                if isinstance(func.value, ast.Name) and func.value.id == 'unreal':
+                    return True
+    return False
+
 def make_py_param_fmt(params):
     """生成 FString::Printf 的格式字符串和参数列表"""
     if not params:
@@ -51,13 +65,16 @@ def make_py_param_fmt(params):
 HEADER_TEMPLATE = """#pragma once
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
-#include "{ClassName}.generated.h"
+#include "{ModuleName}.generated.h"
 
+{ClassDecls}
+"""
+
+UCLASS_TEMPLATE = """
 UCLASS()
 class {ModuleNameUpper}_API {ClassName} : public UObject
 {{
     GENERATED_BODY()
-
 public:
     static {ClassName}* Get();
 
@@ -69,20 +86,35 @@ public:
 }};
 """
 
-CPP_TEMPLATE = """#include "{ClassName}.h"
+FCLASS_TEMPLATE = """
+USTRUCT(BlueprintType)
+struct {ModuleNameUpper}_API {ClassName}
+{{
+    GENERATED_BODY()
+
+    // ---- 静态方法 ----
+{StaticDecls}
+
+    // ---- 非静态方法 ----
+{InstanceDecls}
+}};
+"""
+
+CPP_TEMPLATE = """#include "{ModuleName}.h"
 #include "IPythonScriptPlugin.h"
 
-{ClassName}* {ClassName}::Get()
+{ClassDefs}
+"""
+
+UCLASS_GET_IMPL = """{ClassName}* {ClassName}::Get()
 {{
     static TWeakObjectPtr<{ClassName}> Cached;
-    if (Cached.IsValid())
-        return Cached.Get();
+    if (Cached.IsValid()) return Cached.Get();
 
     TArray<UClass*> PythonClasses;
     GetDerivedClasses({ClassName}::StaticClass(), PythonClasses);
 
-    if (PythonClasses.Num() == 0)
-    {{
+    if (PythonClasses.Num() == 0) {{
         FPythonCommandEx Cmd;
         Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteStatement;
         Cmd.Command = TEXT("import {ModuleName}");
@@ -90,18 +122,12 @@ CPP_TEMPLATE = """#include "{ClassName}.h"
         GetDerivedClasses({ClassName}::StaticClass(), PythonClasses);
     }}
 
-    if (PythonClasses.Num() > 0)
-    {{
+    if (PythonClasses.Num() > 0) {{
         Cached = Cast<{ClassName}>(PythonClasses.Last()->GetDefaultObject());
         return Cached.Get();
     }}
-
     return nullptr;
 }}
-
-{StaticDefs}
-
-{InstanceDefs}
 """
 
 # ------------------ 生成器 ------------------
@@ -111,22 +137,41 @@ def gen_bindings(pyfile, outdir, module_name=None):
 
     if not module_name:
         module_name = os.path.splitext(os.path.basename(pyfile))[0]
-
-    class_name = f"U{upper_first_letter(module_name)}Py"
     module_upper = module_name.upper()
 
     with open(pyfile, 'r', encoding='utf-8-sig') as f:
         tree = ast.parse(f.read())
 
-    static_funcs = []
-    instance_funcs = []
+    # key = class name, value = dict
+    classes = {}
 
-    # ---- 遍历模块级函数 ----
+    # ---- 先放模块级函数 ----
+    top_class_name = f"U{upper_first_letter(module_name)}"
+    classes[top_class_name] = {
+        "is_uclass": True,
+        "static_funcs": [],
+        "instance_funcs": []
+    }
+
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
             params = [(pytype_to_uetype(arg.annotation), upper_first_letter(arg.arg)) for arg in node.args.args]
-            static_funcs.append({"name": node.name, "camel": snake_to_camel(node.name), "params": params})
+            classes[top_class_name]["static_funcs"].append({
+                "name": node.name,
+                "camel": snake_to_camel(node.name),
+                "params": params
+            })
         elif isinstance(node, ast.ClassDef):
+            cname = node.name
+            is_u = has_unreal_uclass(node.decorator_list)
+            prefix = "U" if is_u else "F"
+            cpp_name = f"{prefix}{upper_first_letter(cname)}"
+            if cpp_name not in classes:
+                classes[cpp_name] = {
+                    "is_uclass": is_u,
+                    "static_funcs": [],
+                    "instance_funcs": []
+                }
             for f in node.body:
                 if not isinstance(f, ast.FunctionDef):
                     continue
@@ -135,10 +180,8 @@ def gen_bindings(pyfile, outdir, module_name=None):
                 is_static = is_staticmethod(f.decorator_list[0]) if f.decorator_list else False
                 if not has_self:
                     is_static = True
-
                 arg_list = f.args.args if is_static else f.args.args[1:]
                 params = [(pytype_to_uetype(arg.annotation), upper_first_letter(arg.arg)) for arg in arg_list]
-
                 info = {
                     "name": f.name,
                     "camel": snake_to_camel(f.name),
@@ -147,102 +190,121 @@ def gen_bindings(pyfile, outdir, module_name=None):
                     "is_static": is_static
                 }
                 if is_static:
-                    static_funcs.append(info)
+                    classes[cpp_name]["static_funcs"].append(info)
                 else:
-                    instance_funcs.append(info)
+                    classes[cpp_name]["instance_funcs"].append(info)
 
     # ---- 头文件 ----
-    static_decls = "\n".join([
-        f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
-        f"    static FString {f['camel']}({', '.join([ptype+' '+pname for ptype,pname in f['params']])});"
-        for f in static_funcs
-    ]) or "    // (无静态方法)"
+    class_decls = []
+    for cname, info in classes.items():
+        static_decls = "\n".join([
+            f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
+            f"    static FString {f['camel']}({', '.join([ptype+' '+pname for ptype,pname in f['params']])});"
+            for f in info["static_funcs"]
+        ]) or "    // (无静态方法)"
 
-    instance_decls_list = []
-    for f in instance_funcs:
-        param_str = ", ".join([f"{ptype} {pname}" for ptype,pname in f['params']])
-        ret_type = "bool" if f['is_override'] else "FString"
-        if f['is_override']:
-            instance_decls_list.append(
-                f"    UFUNCTION(BlueprintImplementableEvent, Category=\"{module_name}\")\n"
-                f"    {ret_type} {f['camel']}({param_str});"
-            )
-            instance_decls_list.append(
-                f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
-                f"    static {ret_type} Call{f['camel']}({param_str});"
+        instance_decls_list = []
+        for f in info["instance_funcs"]:
+            param_str = ", ".join([f"{ptype} {pname}" for ptype,pname in f['params']])
+            ret_type = "bool" if f['is_override'] else "FString"
+            if f['is_override']:
+                instance_decls_list.append(
+                    f"    UFUNCTION(BlueprintImplementableEvent, Category=\"{module_name}\")\n"
+                    f"    {ret_type} {f['camel']}({param_str});"
+                )
+                instance_decls_list.append(
+                    f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
+                    f"    static {ret_type} Call{f['camel']}({param_str});"
+                )
+            else:
+                instance_decls_list.append(
+                    f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
+                    f"    {ret_type} {f['camel']}({param_str});"
+                )
+        instance_decls = "\n".join(instance_decls_list) if instance_decls_list else "    // (无实例方法)"
+
+        if info["is_uclass"]:
+            decl = UCLASS_TEMPLATE.format(
+                ClassName=cname,
+                ModuleNameUpper=module_upper,
+                StaticDecls=static_decls,
+                InstanceDecls=instance_decls
             )
         else:
-            instance_decls_list.append(
-                f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
-                f"    {ret_type} {f['camel']}({param_str});"
+            decl = FCLASS_TEMPLATE.format(
+                ClassName=cname,
+                ModuleNameUpper=module_upper,
+                StaticDecls=static_decls,
+                InstanceDecls=instance_decls
             )
-
-    instance_decls = "\n".join(instance_decls_list) if instance_decls_list else "    // (无实例方法)"
+        class_decls.append(decl)
 
     header_code = HEADER_TEMPLATE.format(
-        ClassName=class_name,
-        ModuleNameUpper=module_upper,
-        StaticDecls=static_decls,
-        InstanceDecls=instance_decls
+        ModuleName=module_name,
+        ClassDecls="\n".join(class_decls)
     )
 
     # ---- 源文件 ----
-    static_defs_list = []
-    for f in static_funcs:
-        fmt, values = make_py_param_fmt(f['params'])
-        param_str = ", ".join([ptype+' '+pname for ptype,pname in f['params']])
-        static_defs_list.append(
-            f"FString {class_name}::{f['camel']}({param_str})\n{{\n"
-            f"    FPythonCommandEx Cmd;\n"
-            f"    FString PyCmd = FString::Printf(TEXT(\"import {module_name}; {module_name}.{f['name']}({fmt})\"), {values});\n"
-            f"    Cmd.Command = PyCmd;\n"
-            f"    Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteStatement;\n"
-            f"    IPythonScriptPlugin::Get()->ExecPythonCommandEx(Cmd);\n"
-            f"    return FString();\n}}\n"
-        )
-    static_defs = "\n".join(static_defs_list) if static_defs_list else "// (无静态方法)"
-
-    instance_defs_list = []
-    for f in instance_funcs:
-        param_str = ", ".join([f"{ptype} {pname}" for ptype,pname in f['params']])
-        arg_names = ", ".join([pname for _, pname in f['params']])  # <-- 只用参数名
-        ret_type = "bool" if f['is_override'] else "FString"
-
-        if f['is_override']:
-            instance_defs_list.append(
-                f"{ret_type} {class_name}::Call{f['camel']}({param_str})\n{{\n"
-                f"    {class_name}* Bridge = {class_name}::Get();\n"
-                f"    if (!Bridge) return {ret_type}();\n"
-                f"    return Bridge->{f['camel']}({arg_names});\n}}\n"
-            )
-        else:
+    class_defs = []
+    for cname, info in classes.items():
+        static_defs_list = []
+        for f in info["static_funcs"]:
             fmt, values = make_py_param_fmt(f['params'])
-            instance_defs_list.append(
-                f"{ret_type} {class_name}::{f['camel']}({param_str})\n{{\n"
+            param_str = ", ".join([ptype+' '+pname for ptype,pname in f['params']])
+            static_defs_list.append(
+                f"FString {cname}::{f['camel']}({param_str})\n{{\n"
                 f"    FPythonCommandEx Cmd;\n"
                 f"    FString PyCmd = FString::Printf(TEXT(\"import {module_name}; {module_name}.{f['name']}({fmt})\"), {values});\n"
                 f"    Cmd.Command = PyCmd;\n"
                 f"    Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteStatement;\n"
                 f"    IPythonScriptPlugin::Get()->ExecPythonCommandEx(Cmd);\n"
-                f"    return {ret_type}();\n}}\n"
+                f"    return FString();\n}}\n"
             )
+        static_defs = "\n".join(static_defs_list) if static_defs_list else "// (无静态方法)"
 
-    instance_defs = "\n".join(instance_defs_list) if instance_defs_list else "// (无实例方法)"
+        instance_defs_list = []
+        for f in info["instance_funcs"]:
+            param_str = ", ".join([f"{ptype} {pname}" for ptype,pname in f['params']])
+            arg_names = ", ".join([pname for _, pname in f['params']])
+            ret_type = "bool" if f['is_override'] else "FString"
+            if f['is_override']:
+                instance_defs_list.append(
+                    f"{ret_type} {cname}::Call{f['camel']}({param_str})\n{{\n"
+                    f"    {cname}* Bridge = {cname}::Get();\n"
+                    f"    if (!Bridge) return {ret_type}();\n"
+                    f"    return Bridge->{f['camel']}({arg_names});\n}}\n"
+                )
+            else:
+                fmt, values = make_py_param_fmt(f['params'])
+                instance_defs_list.append(
+                    f"{ret_type} {cname}::{f['camel']}({param_str})\n{{\n"
+                    f"    FPythonCommandEx Cmd;\n"
+                    f"    FString PyCmd = FString::Printf(TEXT(\"import {module_name}; {module_name}.{f['name']}({fmt})\"), {values});\n"
+                    f"    Cmd.Command = PyCmd;\n"
+                    f"    Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteStatement;\n"
+                    f"    IPythonScriptPlugin::Get()->ExecPythonCommandEx(Cmd);\n"
+                    f"    return {ret_type}();\n}}\n"
+                )
+        instance_defs = "\n".join(instance_defs_list) if instance_defs_list else "// (无实例方法)"
+
+        defs = ""
+        if info["is_uclass"]:
+            defs += UCLASS_GET_IMPL.format(ClassName=cname, ModuleName=module_name)
+        defs += static_defs + "\n" + instance_defs
+        class_defs.append(defs)
 
     cpp_code = CPP_TEMPLATE.format(
-        ClassName=class_name,
         ModuleName=module_name,
-        StaticDefs=static_defs,
-        InstanceDefs=instance_defs
+        ClassDefs="\n".join(class_defs)
     )
 
     # ---- 输出 ----
     os.makedirs(outdir, exist_ok=True)
-    hfile = os.path.join(outdir, f"{class_name}.h")
-    cppfile = os.path.join(outdir, f"{class_name}.cpp")
-    with open(hfile,'w',encoding='utf-8') as f:
+    hfile = os.path.join(outdir, f"{module_name}.h")
+    cppfile = os.path.join(outdir, f"{module_name}.cpp")
+    with open(hfile, 'w', encoding='utf-8') as f:
         f.write(header_code)
-    with open(cppfile,'w',encoding='utf-8') as f:
+    with open(cppfile, 'w', encoding='utf-8') as f:
         f.write(cpp_code)
     print(f"✅ 生成完成: {hfile}, {cppfile}")
 
