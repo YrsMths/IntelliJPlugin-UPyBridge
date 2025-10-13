@@ -76,7 +76,7 @@ class {ModuleNameUpper}_API {ClassName} : public UObject
 {{
     GENERATED_BODY()
 public:
-    static {ClassName}* Get();
+{GetDeclOpt}
 
     // ---- 静态方法 ----
 {StaticDecls}
@@ -102,6 +102,7 @@ struct {ModuleNameUpper}_API {ClassName}
 
 CPP_TEMPLATE = """#include "{ModuleName}.h"
 #include "IPythonScriptPlugin.h"
+#include "PythonScriptTypes.h"
 
 {ClassDefs}
 """
@@ -198,7 +199,7 @@ def gen_bindings(pyfile, outdir, module_name=None):
     class_decls = []
     for cname, info in classes.items():
         static_decls = "\n".join([
-            f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
+            f"    UFUNCTION(BlueprintCallable, Category=Python)\n"
             f"    static FString {f['camel']}({', '.join([ptype+' '+pname for ptype,pname in f['params']])});"
             for f in info["static_funcs"]
         ]) or "    // (无静态方法)"
@@ -209,26 +210,29 @@ def gen_bindings(pyfile, outdir, module_name=None):
             ret_type = "bool" if f['is_override'] else "FString"
             if f['is_override']:
                 instance_decls_list.append(
-                    f"    UFUNCTION(BlueprintImplementableEvent, Category=\"{module_name}\")\n"
+                    f"    UFUNCTION(BlueprintImplementableEvent, Category=Python)\n"
                     f"    {ret_type} {f['camel']}({param_str});"
                 )
                 instance_decls_list.append(
-                    f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
+                    f"    UFUNCTION(BlueprintCallable, Category=Python)\n"
                     f"    static {ret_type} Call{f['camel']}({param_str});"
                 )
             else:
                 instance_decls_list.append(
-                    f"    UFUNCTION(BlueprintCallable, Category=\"{module_name}\")\n"
+                    f"    UFUNCTION(BlueprintCallable, Category=Python)\n"
                     f"    {ret_type} {f['camel']}({param_str});"
                 )
         instance_decls = "\n".join(instance_decls_list) if instance_decls_list else "    // (无实例方法)"
+
+        is_top_class = (cname == top_class_name)
 
         if info["is_uclass"]:
             decl = UCLASS_TEMPLATE.format(
                 ClassName=cname,
                 ModuleNameUpper=module_upper,
                 StaticDecls=static_decls,
-                InstanceDecls=instance_decls
+                InstanceDecls=instance_decls,
+                GetDeclOpt=("" if is_top_class else f"    static {cname}* Get();")
             )
         else:
             decl = FCLASS_TEMPLATE.format(
@@ -288,7 +292,7 @@ def gen_bindings(pyfile, outdir, module_name=None):
         instance_defs = "\n".join(instance_defs_list) if instance_defs_list else "// (无实例方法)"
 
         defs = ""
-        if info["is_uclass"]:
+        if info["is_uclass"] and cname != top_class_name:
             defs += UCLASS_GET_IMPL.format(ClassName=cname, ModuleName=module_name)
         defs += static_defs + "\n" + instance_defs
         class_defs.append(defs)
@@ -311,7 +315,7 @@ def gen_bindings(pyfile, outdir, module_name=None):
 # ------------------ 主程序 ------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python gen_bindings.py <module.py>")
+        print("用法: python upy_bridge.py <module.py>")
         sys.exit(1)
     pyfile = sys.argv[1]
     if not os.path.exists(pyfile):
